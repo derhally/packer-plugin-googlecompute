@@ -151,3 +151,69 @@ func TestImportOSLoginSSHKey_PersistentConflictIsReturned(t *testing.T) {
 	assert.Equal(t, 10, fake.calls())
 	fake.assertAllRequests(t, importRequest)
 }
+
+const deleteRequest = "DELETE /v1/users/sa@example.com/sshPublicKeys/abc123"
+
+func TestDeleteOSLoginSSHKey_RetriesConflictThenSucceeds(t *testing.T) {
+	noOSLoginRetrySleep(t)
+	d, fake := newOSLoginTestDriver(t, conflict, osLoginResponse{status: http.StatusOK, body: `{}`})
+
+	err := d.DeleteOSLoginSSHKey("sa@example.com", "abc123")
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, fake.calls())
+	fake.assertAllRequests(t, deleteRequest)
+}
+
+func TestDeleteOSLoginSSHKey_PersistentConflictIsReturned(t *testing.T) {
+	noOSLoginRetrySleep(t)
+	d, fake := newOSLoginTestDriver(t, conflict)
+
+	err := d.DeleteOSLoginSSHKey("sa@example.com", "abc123")
+
+	var apiErr *googleapi.Error
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, http.StatusConflict, apiErr.Code)
+	assert.Equal(t, 10, fake.calls())
+	fake.assertAllRequests(t, deleteRequest)
+}
+
+func TestDeleteOSLoginSSHKey_NonRetryableErrorIsReturned(t *testing.T) {
+	d, fake := newOSLoginTestDriver(t, osLoginResponse{status: http.StatusForbidden, body: osLoginErrorBody(403, "permission denied")})
+
+	err := d.DeleteOSLoginSSHKey("sa@example.com", "abc123")
+
+	var apiErr *googleapi.Error
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, http.StatusForbidden, apiErr.Code)
+	assert.Equal(t, 1, fake.calls(), "non-409 errors must not be retried")
+	fake.assertAllRequests(t, deleteRequest)
+}
+
+func TestDeleteOSLoginSSHKey_AlreadyGoneAfterConflictIsSuccess(t *testing.T) {
+	noOSLoginRetrySleep(t)
+	d, fake := newOSLoginTestDriver(t, conflict, osLoginResponse{status: http.StatusNotFound, body: osLoginErrorBody(404, "not found")})
+
+	err := d.DeleteOSLoginSSHKey("sa@example.com", "abc123")
+
+	require.NoError(t, err, "a key that is already gone has been cleaned up")
+	assert.Equal(t, 2, fake.calls())
+	fake.assertAllRequests(t, deleteRequest)
+}
+
+func TestDeleteOSLoginSSHKey_AlreadyGoneIsSuccess(t *testing.T) {
+	d, fake := newOSLoginTestDriver(t, osLoginResponse{status: http.StatusNotFound, body: osLoginErrorBody(404, "not found")})
+
+	err := d.DeleteOSLoginSSHKey("sa@example.com", "abc123")
+
+	require.NoError(t, err, "a key that is already gone has been cleaned up")
+	assert.Equal(t, 1, fake.calls())
+	fake.assertAllRequests(t, deleteRequest)
+}
+
+func TestIsConflictAPIError(t *testing.T) {
+	assert.True(t, isConflictAPIError(&googleapi.Error{Code: 409}))
+	assert.True(t, isConflictAPIError(fmt.Errorf("import: %w", &googleapi.Error{Code: 409})), "wrapped 409s must be recognised")
+	assert.False(t, isConflictAPIError(&googleapi.Error{Code: 400}))
+	assert.False(t, isConflictAPIError(nil))
+}

@@ -1014,7 +1014,7 @@ func (d *driverGCE) ImportOSLoginSSHKey(user, sshPublicKey string, expirationTim
 			return resp.LoginProfile, nil
 		}
 		// Retry on concurrent mutation errors
-		if gErr, ok := err.(*googleapi.Error); ok && gErr.Code == 409 && (i+1 < maxRetries) {
+		if isConflictAPIError(err) && (i+1 < maxRetries) {
 			log.Printf("ImportSshPublicKey conflict (try %d/%d): %v", i+1, maxRetries, err)
 			sleepSecs := retrySleepSeconds()
 			// Sleep between 5-15 seconds (randomly chosen) before retry
@@ -1036,14 +1036,42 @@ func retrySleepSeconds() int {
 	return int(offset.Int64()) + 5
 }
 
+// isAPIErrorCode reports whether err is, or wraps, a Google API error with the
+// given HTTP status.
+func isAPIErrorCode(err error, code int) bool {
+	var apiErr *googleapi.Error
+	return errors.As(err, &apiErr) && apiErr.Code == code
+}
+
+// isConflictAPIError reports whether err is the 409 OS Login returns when
+// concurrent requests mutate the same login profile.
+func isConflictAPIError(err error) bool {
+	return isAPIErrorCode(err, http.StatusConflict)
+}
+
 func (d *driverGCE) DeleteOSLoginSSHKey(user, fingerprint string) error {
 	name := fmt.Sprintf("users/%s/sshPublicKeys/%s", user, fingerprint)
-	_, err := d.osLoginService.Users.SshPublicKeys.Delete(name).Do()
-	if err != nil {
-		return err
-	}
 
-	return nil
+	// Deletes hit the same concurrent-mutation conflicts as imports when builds
+	// run in parallel, and a failed delete leaves the key on the login profile,
+	// which is capped at 32 KiB.
+	const maxRetries = 10
+	var err error
+	for i := 0; i < maxRetries; i++ {
+		_, err = d.osLoginService.Users.SshPublicKeys.Delete(name).Do()
+		// A 404 means the key is already gone (it expired, or something else
+		// removed it while we were retrying), which is the state we want.
+		if err == nil || isAPIErrorCode(err, http.StatusNotFound) {
+			return nil
+		}
+		if isConflictAPIError(err) && (i+1 < maxRetries) {
+			log.Printf("SshPublicKeys.Delete conflict (try %d/%d): %v", i+1, maxRetries, err)
+			osLoginRetrySleep(time.Duration(retrySleepSeconds()) * time.Second)
+		} else {
+			break
+		}
+	}
+	return err
 }
 
 func (d *driverGCE) WaitForInstance(state, zone, name string) <-chan error {
